@@ -1,0 +1,20 @@
+name: EA Sanity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  sanity:
+    name: EA Sanity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run EA sanity checks
+        run: bash scripts/check_ea_sanity.sh

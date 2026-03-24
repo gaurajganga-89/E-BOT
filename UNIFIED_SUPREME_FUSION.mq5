@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.37"
-#property description "USMF MTF v1.37 (per-chart). Adds: OrderSend retry + retcode decode, full TradeLines module (ENTRY/SL/TP1/TP2/TP3 + sync + delete), RiskGuards (EA-only loss streak rolling N=3 + 90min cooldown), Symbol Diagnostics panel, NormalizePrice(ticksize), pre-trade stops/freeze checks, AutoTune by SYMBOL_TRADE_CALC_MODE + symbol hints. Keeps: AutoDailySL(3R), BasketTrail(R)+PostCooldown, strict risk sizing, manual SL detect, partial close, TP->trail switch, anti-modify spam, sessions/news, MTF range(H1/H4/D1), HTF+D1 scoring, confirm/range rejection/impulse retest+delay."
+#property version   "1.36"
+#property description "USMF MTF v1.36 (MTF+MinSL+MinRR guards)"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -230,6 +230,15 @@ input int    InpLossStreakCooldownMin         = 90;    // cooldown minutes after
 input bool   InpLossCalcIncludeCommSwap       = true;  // compute PnL incl commission+swap (net)
 input bool   InpResetLossStreakOnNewDay       = false; // if true: loss streak only counts within current day
 
+// --- Min SL distance guard (NEW v1.36) ---
+input bool   InpUseMinSLDistanceGuard         = true;
+input double InpMinSLDistance_ATRMult         = 1.0;  // minimum SL distance as multiple of ATR
+
+// --- Min RR guard (NEW v1.36) ---
+input bool   InpUseMinRRGuard                 = true;
+input double InpMinRR                         = 1.5;  // minimum risk-reward ratio
+input bool   InpMinRR_DisableTPOnly           = false; // if true: allow entry but set TP=0; if false: block entry
+
 // --- OrderSend retry (NEW v1.35) ---
 input bool   InpUseOrderSendRetry             = true;
 input int    InpOrderSendMaxTries             = 3;
@@ -320,6 +329,10 @@ int      g_lossStreak=0;
 double   g_lastClosedPnL=0.0;
 datetime g_lastClosedTime=0;
 datetime g_lossCooldownUntil=0;
+
+// v1.36 guard diagnostics
+string   g_lastMinSLWhy="";
+string   g_lastMinRRWhy="";
 
 // auto-tune recommended (computed)
 string g_tuneType="NONE";
@@ -586,7 +599,6 @@ string RetcodeText(const uint rc)
     case TRADE_RETCODE_NO_MONEY:           return "NO_MONEY";
     case TRADE_RETCODE_PRICE_CHANGED:      return "PRICE_CHANGED";
     case TRADE_RETCODE_PRICE_OFF:          return "PRICE_OFF";
-    case TRADE_RETCODE_NO_QUOTES:          return "NO_QUOTES";
     case TRADE_RETCODE_CONNECTION:         return "CONNECTION";
     case TRADE_RETCODE_ONLY_REAL:          return "ONLY_REAL";
     case TRADE_RETCODE_TOO_MANY_REQUESTS:  return "TOO_MANY_REQ";
@@ -887,6 +899,65 @@ bool LossGuardBlocked(string &why)
   }
 
   return false;
+}
+
+// =====================================================
+// MIN SL DISTANCE GUARD (NEW v1.36)
+// =====================================================
+bool MinSLDistanceOK(const bool isBuy, const double entry, const double sl, const double atr1, string &why)
+{
+  why="";
+  if(!InpUseMinSLDistanceGuard) return true;
+  if(atr1<=0)                   return true;  // cannot evaluate without ATR
+
+  double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+  if(tickSize<=0) tickSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+  double minDist  = NormalizeDouble(InpMinSLDistance_ATRMult * atr1, _Digits);
+  double slDist   = MathAbs(entry - sl);
+
+  if(slDist < minDist)
+  {
+    why = StringFormat("MinSLDist:%.5f<%.5f(%.1fxATR)", slDist, minDist, InpMinSLDistance_ATRMult);
+    return false;
+  }
+  return true;
+}
+
+// =====================================================
+// MIN RR GUARD (NEW v1.36)
+// =====================================================
+// Returns true if entry is OK to proceed.
+// If InpMinRR_DisableTPOnly=true and RR is too low: sets tp=0 and returns true (entry allowed, no TP).
+// If InpMinRR_DisableTPOnly=false and RR is too low: sets why and returns false (entry blocked).
+// If tp<=0: guard is skipped (cannot compute RR without TP).
+bool MinRROK(const bool isBuy, const double entry, const double sl, double &tp, string &why)
+{
+  why="";
+  if(!InpUseMinRRGuard) return true;
+  if(tp<=0)             return true;  // no TP -> cannot compute RR, skip guard (Option 1)
+
+  double risk   = MathAbs(entry - sl);
+  if(risk<=0)   return true;  // degenerate case
+
+  double reward = MathAbs(tp - entry);
+  double rr     = reward / risk;
+
+  if(rr < InpMinRR)
+  {
+    if(InpMinRR_DisableTPOnly)
+    {
+      tp  = 0.0;
+      why = StringFormat("MinRR:%.2f<%.2f->NoTP", rr, InpMinRR);
+      return true;   // entry allowed, TP removed
+    }
+    else
+    {
+      why = StringFormat("MinRR:%.2f<%.2f->Block", rr, InpMinRR);
+      return false;  // entry blocked
+    }
+  }
+  return true;
 }
 
 // =====================================================
@@ -1945,7 +2016,6 @@ bool IsRetryRetcode(const uint rc)
   return (rc==TRADE_RETCODE_REQUOTE ||
           rc==TRADE_RETCODE_PRICE_CHANGED ||
           rc==TRADE_RETCODE_PRICE_OFF ||
-          rc==TRADE_RETCODE_NO_QUOTES ||
           rc==TRADE_RETCODE_TIMEOUT ||
           rc==TRADE_RETCODE_CONNECTION ||
           rc==TRADE_RETCODE_TOO_MANY_REQUESTS);
@@ -2401,7 +2471,7 @@ void OnTick()
     string cmTxt=CalcModeText(cm);
 
     int ln=0;
-    PanelSetLine(ln++, pc, BOT_NAME+" v1.37");
+    PanelSetLine(ln++, pc, BOT_NAME+" v1.36");
     PanelSetLine(ln++, InpPanelColorInfo, StringFormat("%s %s | MODE=%s | symMode=%s | calc=%s",
       _Symbol, EnumToString(_Period), EnumToString(InpStrategyMode), symMode, cmTxt));
     PanelSetLine(ln++, InpPanelColorInfo, (StringLen(InpTradeSymbol)>0 ? ("TRADE_SYMBOL="+InpTradeSymbol) : "TRADE_SYMBOL=CHART"));
@@ -2416,6 +2486,15 @@ void OnTick()
     PanelSetLine(ln++, InpPanelColorInfo, StringFormat("LOSS GUARD: streak=%d/%d cdLeft=%dmin lastPnL=%.2f at=%s",
       g_lossStreak, InpMaxConsecutiveLosses, lossCDLeft, g_lastClosedPnL,
       (g_lastClosedTime>0?TimeToString(g_lastClosedTime,TIME_MINUTES):"none")));
+
+    {
+      string minSLState = (InpUseMinSLDistanceGuard ? StringFormat("ON mult=%.1f", InpMinSLDistance_ATRMult) : "OFF");
+      string minSLLast  = (g_lastMinSLWhy!="" ? g_lastMinSLWhy : "OK");
+      string minRRState = (InpUseMinRRGuard ? StringFormat("ON min=%.2f tpOnly=%s", InpMinRR, (InpMinRR_DisableTPOnly?"Y":"N")) : "OFF");
+      string minRRLast  = (g_lastMinRRWhy!="" ? g_lastMinRRWhy : "OK");
+      PanelSetLine(ln++, InpPanelColorInfo, StringFormat("MinSLDist: %s last=%s | MinRR: %s last=%s",
+        minSLState, minSLLast, minRRState, minRRLast));
+    }
 
     PanelSetLine(ln++, InpPanelColorInfo, StringFormat("SPREAD: %d pts | %.8f price | %.3f%% | max=%d pts",
       SpreadPoints(), spP, spPct, InpMaxSpreadPoints));
@@ -2544,6 +2623,24 @@ void OnTick()
   sl    = NormalizePrice(sl);
   if(tp>0) tp = NormalizePrice(tp);
 
+  // min SL distance guard (NEW v1.36)
+  string whyMinSL="";
+  if(!MinSLDistanceOK(best.isBuy, entry, sl, atr1, whyMinSL))
+  {
+    g_lastMinSLWhy=whyMinSL;
+    return;
+  }
+  g_lastMinSLWhy=whyMinSL; // may be "" if guard passed
+
+  // min RR guard (NEW v1.36) — tp may be set to 0 if InpMinRR_DisableTPOnly=true
+  string whyMinRR="";
+  if(!MinRROK(best.isBuy, entry, sl, tp, whyMinRR))
+  {
+    g_lastMinRRWhy=whyMinRR;
+    return;
+  }
+  g_lastMinRRWhy=whyMinRR; // may contain info if TP was disabled
+
   // stops/freeze check
   string whyStops="";
   ENUM_ORDER_TYPE ordType = (best.isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
@@ -2580,7 +2677,7 @@ void OnTick()
   req.price     = entry;
   req.sl        = sl;
   req.tp        = tp;
-  req.comment   = BOT_NAME+" "+best.name+" sc="+DoubleToString(best.score,2)+" v1.37";
+  req.comment   = BOT_NAME+" "+best.name+" sc="+DoubleToString(best.score,2)+" v1.36";
 
   ResetLastError();
   bool ok = OrderSendWithRetry(req,res,InpOrderSendMaxTries,InpOrderSendRetryDelayMs);
